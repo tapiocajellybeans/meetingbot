@@ -24,7 +24,7 @@ from telegram.ext import (
 
 # ----- Configuration -----
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "meetings.db")
+DB_PATH = os.getenv("DB_PATH")
 LOG_LEVEL = logging.INFO
 TIMEZONE = ZoneInfo("Asia/Singapore")
 WEEKLY_CRON = {"day_of_week": "mon", "hour": 8, "minute": 0}  # every Monday 08:00
@@ -343,3 +343,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
