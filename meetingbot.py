@@ -1,8 +1,8 @@
 # bot.py
-import logging
 import os
 import sqlite3
 import threading
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib import request
@@ -19,19 +19,23 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from telegram.constants import ParseMode
 
 # ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "meetings.db"  # always local file
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is missing!")
+
+DB_PATH = "meetings.db"
 TIMEZONE = ZoneInfo("Asia/Singapore")
-WEEKLY_CRON = {"day_of_week": "mon", "hour": 8, "minute": 0}  # every Monday 08:00
-SELF_URL = os.getenv("SELF_URL")  # optional self-ping for uptime
+WEEKLY_CRON = {"day_of_week": "mon", "hour": 8, "minute": 0}  # weekly schedule
+SELF_URL = os.getenv("SELF_URL")  # optional ping
 LOG_LEVEL = logging.INFO
 # ----------------------------------------
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=LOG_LEVEL,
+    level=LOG_LEVEL
 )
 logger = logging.getLogger(__name__)
 
@@ -39,17 +43,17 @@ logger = logging.getLogger(__name__)
 def init_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS meetings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            start_ts TEXT NOT NULL,
-            end_ts TEXT,
-            created_at TEXT NOT NULL
-        )"""
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        start_ts TEXT NOT NULL,
+        end_ts TEXT,
+        created_at TEXT NOT NULL
     )
+    """)
     con.commit()
     con.close()
 
@@ -65,20 +69,6 @@ def db_execute(query, params=(), fetch=False):
         con.commit()
         con.close()
         return None
-
-def add_meeting(chat_id, title, description, start_dt, end_dt=None):
-    db_execute(
-        "INSERT INTO meetings (chat_id, title, description, start_ts, end_ts, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (chat_id, title, description or "", start_dt.isoformat(), end_dt.isoformat() if end_dt else None, datetime.now().isoformat()),
-    )
-    logger.info("Added meeting for chat %s: %s", chat_id, title)
-
-def list_meetings(chat_id):
-    return db_execute(
-        "SELECT id, title, description, start_ts, end_ts FROM meetings WHERE chat_id = ? ORDER BY start_ts",
-        (chat_id,),
-        fetch=True
-    )
 
 # ---------------- Parsing ----------------
 def parse_dt(text: str):
@@ -106,19 +96,18 @@ def fmt_meeting(row):
         s += f"\ndesc: {desc}"
     return s
 
-# ---------------- Bot Commands ----------------
+# ---------------- Bot ----------------
+ADD_TITLE, ADD_DESC, ADD_START = range(3)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hi! I'm your MeetingBot.\n"
-        "Commands:\n"
         "/add - add a meeting\n"
         "/list - list meetings\n"
         "/delete <id> - delete meeting\n"
         "/weekly - send weekly schedule now\n\n"
         "Date/time format for adding: YYYY MM DD HHMM - HHMM"
     )
-
-ADD_TITLE, ADD_DESC, ADD_START = range(3)
 
 async def add_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Send meeting title:")
@@ -145,7 +134,11 @@ async def add_start_dt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Couldn't parse. Format: YYYY MM DD HHMM - HHMM")
         return ADD_START
     m = context.user_data["meeting"]
-    add_meeting(update.effective_chat.id, m["title"], m.get("description",""), start_dt, end_dt)
+    db_execute(
+        "INSERT INTO meetings (chat_id,title,description,start_ts,end_ts,created_at) VALUES (?,?,?,?,?,?)",
+        (update.effective_chat.id, m["title"], m.get("description",""), start_dt.isoformat(),
+         end_dt.isoformat() if end_dt else None, datetime.now().isoformat())
+    )
     await update.message.reply_text("Meeting added ✅")
     return ConversationHandler.END
 
@@ -155,12 +148,12 @@ async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = list_meetings(update.effective_chat.id)
+    rows = db_execute("SELECT id,title,description,start_ts,end_ts FROM meetings WHERE chat_id=? ORDER BY start_ts",
+                      (update.effective_chat.id,), fetch=True)
     if not rows:
         await update.message.reply_text("No meetings stored.")
         return
-    out = "\n\n".join(fmt_meeting(r) for r in rows)
-    await update.message.reply_text(out)
+    await update.message.reply_text("\n\n".join(fmt_meeting(r) for r in rows))
 
 async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -172,24 +165,17 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("ID must be a number.")
         return
-    rows = list_meetings(update.effective_chat.id)
-    if not any(r[0]==mid for r in rows):
-        await update.message.reply_text("No meeting with that ID.")
-        return
-    db_execute("DELETE FROM meetings WHERE id=?",(mid,))
+    db_execute("DELETE FROM meetings WHERE id=? AND chat_id=?", (mid, update.effective_chat.id))
     await update.message.reply_text("Deleted ✅")
 
 async def send_weekly(chat_id, app):
     now = datetime.now(TIMEZONE)
-    rows = db_execute(
-        "SELECT id, title, description, start_ts, end_ts FROM meetings WHERE chat_id=? AND start_ts BETWEEN ? AND ? ORDER BY start_ts",
-        (chat_id, now.isoformat(), (now + timedelta(days=7)).isoformat()),
-        fetch=True
-    )
+    rows = db_execute("SELECT id,title,description,start_ts,end_ts FROM meetings WHERE chat_id=? AND start_ts BETWEEN ? AND ? ORDER BY start_ts",
+                      (chat_id, now.isoformat(), (now+timedelta(days=7)).isoformat()), fetch=True)
     if not rows:
         text = "No meetings scheduled for the next 7 days."
     else:
-        parts = ["Your upcoming meetings (next 7 days):"]
+        parts = ["Upcoming meetings (next 7 days):"]
         for i,r in enumerate(rows,1):
             mid,title,desc,start_ts,end_ts = r
             start_dt = datetime.fromisoformat(start_ts).astimezone(TIMEZONE)
@@ -234,33 +220,32 @@ def run_flask():
 # ---------------- Main ----------------
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    # v20 Application (safe version)
+    app = Application.builder().token(BOT_TOKEN).parse_mode(ParseMode.HTML).build()
 
-    # Handlers
+    # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(CommandHandler("weekly", weekly_now))
 
+    # Conversation
     add_conv = ConversationHandler(
         entry_points=[CommandHandler("add", add_start_cmd)],
         states={
             ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
-            ADD_DESC: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc),
-                CommandHandler("skip", add_skip_desc)
-            ],
+            ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc),
+                       CommandHandler("skip", add_skip_desc)],
             ADD_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_start_dt)]
         },
-        fallbacks=[CommandHandler("cancel", add_cancel)],
+        fallbacks=[CommandHandler("cancel", add_cancel)]
     )
     app.add_handler(add_conv)
 
     # Scheduler
     scheduler = BackgroundScheduler(timezone=TIMEZONE)
-    trigger = CronTrigger(**WEEKLY_CRON, timezone=TIMEZONE)
-    scheduler.add_job(lambda: scheduled_weekly_job(app), trigger=trigger, id="weekly_schedule")
-    scheduler.add_job(self_ping, 'interval', minutes=5, id="self_ping")
+    scheduler.add_job(lambda: scheduled_weekly_job(app), CronTrigger(**WEEKLY_CRON, timezone=TIMEZONE))
+    scheduler.add_job(self_ping, 'interval', minutes=5)
     scheduler.start()
 
     # Flask thread
