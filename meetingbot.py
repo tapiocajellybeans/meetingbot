@@ -154,7 +154,7 @@ def fmt_meeting_row(row) -> str:
 
 # ----- Bot Commands -----
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    await update.effective_chat.send_message(
         "Hi! I'm your MeetingBot.\nCommands:\n"
         "/add - add a meeting\n"
         "/list - list meetings\n"
@@ -299,7 +299,9 @@ def home():
     return "Bot is running ✅"
 
 def run_web():
-    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    port = int(os.environ.get("PORT", 8080))  # Replit expects this
+    print(f"Starting Flask on port {port}")
+    app_flask.run(host="0.0.0.0", port=port)
 
 # ----- Main -----
 def main():
@@ -333,7 +335,7 @@ def main():
     logger.info("Scheduler started")
 
     # Run Flask server in thread
-    threading.Thread(target=run_web).start()
+    threading.Thread(target=run_web, daemon=True).start()
 
     # Run bot
     logger.info("Starting bot...")
